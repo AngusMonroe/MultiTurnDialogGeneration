@@ -1,288 +1,338 @@
 # -*- coding:utf-8 -*-
+from __future__ import absolute_import
 from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
 
-import time
+import torch
+from torch.jit import script, trace
 import torch.nn as nn
-from torch import cuda
-from seq2seq.models import Seq2SeqDialogModel
-from utils.dataset import *
-from utils.io_utils import *
-from utils.optimizer import Optim
+from torch import optim
+import torch.nn.functional as F
+import csv
+import random
+import re
+import os
+import unicodedata
+import codecs
+from io import open
+import itertools
+import math
+from utils.util import *
+from model import *
 
-config_path = './config.json'
-configs = load_configs(config_path)
+corpus_name = "cornell-movie-dialogs-corpus"
+corpus = os.path.join("data", corpus_name)
+# Define path to new file
+datafile = os.path.join(corpus, "formatted_movie_lines.txt")
 
-if torch.cuda.is_available() and not configs['gpus']:
-    print("WARNING: You have a CUDA device, should run with -gpus 0")
-    configs['cuda'] = False
+USE_CUDA = torch.cuda.is_available()
+device = torch.device("cuda" if USE_CUDA else "cpu")
 
-if configs['gpus']:
-    cuda.set_device(configs['gpus'][0])
+MAX_LENGTH = 10
 
-print_configs(configs)
+# Load/Assemble voc and pairs
+save_dir = os.path.join("data", "save")
+voc, pairs = loadPrepareData(corpus, corpus_name, datafile, save_dir, MAX_LENGTH)
+# Print some pairs to validate
+# print("\npairs:")
+# for pair in pairs[:10]:
+#     print(pair)
 
+# Trim voc and pairs
+pairs = trimRareWords(voc, pairs)
 
-def loss_criterion(vocab_size):
-    weight = torch.ones(vocab_size)
-    weight[Constants.PAD] = 0
-    crit = nn.CrossEntropyLoss(weight)
-    if configs['gpus']:
-        crit.cuda()
-    return crit
-
-
-def memory_efficient_loss(outputs, targets, generator, crit, eval_flag=False):
-    # compute generations one piece at a time
-    num_correct, loss = 0, 0
-    outputs = Variable(outputs.data, requires_grad=(not eval_flag), volatile=eval_flag)
-
-    outputs_split = torch.split(outputs, configs['max_generator_batches'])
-    targets_split = torch.split(targets, configs['max_generator_batches'])
-    for i, (out_t, tgt_t) in enumerate(zip(outputs_split, targets_split)):
-        out_t = out_t.view(-1, out_t.size(2))
-        scores_t = generator(out_t)
-        loss_t = crit(scores_t, tgt_t.view(-1))
-        pred_t = scores_t.max(1)[1]
-        num_correct_t = pred_t.data.eq(tgt_t.data) \
-            .masked_select(tgt_t.ne(Constants.PAD).data) \
-            .sum()
-        num_correct += num_correct_t
-        loss += loss_t.data[0]
-        if not eval_flag:
-            loss_t.backward()
-
-    grad_output = None if outputs.grad is None else outputs.grad.data
-    return loss / len(outputs_split), grad_output, num_correct
+# Example for validation
+# small_batch_size = 5
+# batches = batch2TrainData(voc, [random.choice(pairs) for _ in range(small_batch_size)])
+# input_variable, lengths, target_variable, mask, max_target_len = batches
+#
+# print("input_variable:", input_variable)
+# print("lengths:", lengths)
+# print("target_variable:", target_variable)
+# print("mask:", mask)
+# print("max_target_len:", max_target_len)
 
 
-def evaluate(model, criterion, data):
-    total_loss = 0
-    total_words = 0
-    total_num_correct = 0
+class GreedySearchDecoder(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(GreedySearchDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
 
-    model.eval()
-    for i in range(len(data)):
-        batch_turns, turn_mask = data[i]
-        utter_hidden = None
-        for k in range(len(batch_turns) - 1):
-            src_turn = batch_turns[k]
-            trg_turn = batch_turns[k + 1]
-
-            outputs, utter_hidden = model(src_turn, trg_turn[:-1], utter_hidden)
-            # exclude <s> from targets
-            targets = trg_turn[1:]
-            loss, _, num_correct = memory_efficient_loss(
-                outputs, targets, model.generator, criterion, eval_flag=True)
-
-            total_loss += loss / (len(batch_turns) - 1)
-            total_num_correct += num_correct
-            total_words += targets.data.ne(Constants.PAD).sum()
-
-    model.train()
-    return total_loss / len(data), total_num_correct / total_words
-
-
-def train_model(model, train_set, valid_set, vocab, optim):
-    print(model)
-    model.train()
-
-    # Define criterion of each GPU.
-    criterion = loss_criterion(vocab.size)
-
-    start_time = time.time()
-
-    def train_epoch(epoch):
-
-        if configs['extra_shuffle']:
-            train_set.shuffle()
-
-        # Shuffle mini batch order.
-        batch_order = torch.randperm(len(train_set))
-
-        total_loss, total_words, total_num_correct = 0, 0, 0
-        report_loss, report_tgt_words = 0, 0
-        report_src_words, report_num_correct = 0, 0
-        start = time.time()
-        for i in range(len(train_set)):
-
-            batch_idx = batch_order[i]
-            # Exclude original indices.
-            batch_turns, turn_mask = train_set[batch_idx]
-            utter_hidden = None
-
-            for k in range(len(batch_turns) - 1):
-                optim.zero_grad()
-                src_turn = batch_turns[k]
-                trg_turn = batch_turns[k + 1]
-                outputs, utter_hidden = model(src_turn, trg_turn[:-1], utter_hidden)
-                # Exclude <s> from targets.
-                targets = trg_turn[1:]
-
-                loss_k, grad_output, num_correct = memory_efficient_loss(
-                    outputs, targets, model.generator, criterion)
-
-                outputs.backward(grad_output, retain_variables=True)
-
-                num_words = targets.data.ne(Constants.PAD).sum()
-                report_num_correct += num_correct
-                report_tgt_words += num_words
-                report_src_words += src_turn[0].data.sum()
-                total_num_correct += num_correct
-                total_words += num_words
-
-                report_loss += loss_k / (len(batch_turns) - 1)
-                total_loss += loss_k / (len(batch_turns) - 1)
-
-                # Update the parameters.
-                optim.step()
-
-            if i % configs['log_interval'] == -1 % configs['log_interval']:
-                print(("Epoch %2d, %5d/%5d; acc: %6.2f; ppl: %6.2f; " +
-                       "%3.0f src tok/s; %3.0f tgt tok/s; %6.0f s elapsed") %
-                      (epoch, i + 1, len(train_set),
-                       report_num_correct / report_tgt_words * 100,
-                       math.exp(report_loss / configs['log_interval']),
-                       report_src_words / (time.time() - start),
-                       report_tgt_words / (time.time() - start),
-                       time.time() - start_time))
-
-                report_loss, report_tgt_words = 0, 0
-                report_src_words, report_num_correct = 0, 0
-                start = time.time()
-
-        return total_loss / len(train_set), total_num_correct / total_words
-
-    for epoch in range(configs['start_epoch'], configs['num_epochs'] + 1):
-        print('')
-
-        #  (1) train for one epoch on the training set
-        train_loss, train_acc = train_epoch(epoch)
-        train_ppl = math.exp(min(train_loss, 100))
-        print('Train perplexity: %g' % train_ppl)
-        print('Train accuracy: %g' % (train_acc * 100))
-
-        #  (2) evaluate on the validation set
-        valid_loss, valid_acc = evaluate(model, criterion, valid_set)
-        valid_ppl = math.exp(min(valid_loss, 100))
-        print('Validation perplexity: %g' % valid_ppl)
-        print('Validation accuracy: %g' % (valid_acc * 100))
-
-        #  (3) update the learning rate
-        optim.update_learning_rate(valid_ppl, epoch)
-
-        model_state_dict = (model.module.state_dict() if len(configs['gpus']) > 1
-                            else model.state_dict())
-        model_state_dict = {k: v for k, v in model_state_dict.items()
-                            if 'generator' not in k}
-        generator_state_dict = (model.generator.module.state_dict()
-                                if len(configs['gpus']) > 1
-                                else model.generator.state_dict())
-        #  (4) drop a checkpoint
-        checkpoint = {
-            'model': model_state_dict,
-            'generator': generator_state_dict,
-            'vocab': vocab,
-            'config': configs,
-            'epoch': epoch,
-            'optim': optim
-        }
-        torch.save(checkpoint,
-                   '%s_acc_%.2f_ppl_%.2f_e%d.pt'
-                   % (configs['data_dir'] + configs['checkpoints'], 100 * valid_acc, valid_ppl, epoch))
+    def forward(self, input_seq, input_length, max_length):
+        # Forward input through encoder model
+        encoder_outputs, encoder_hidden = self.encoder(input_seq, input_length)
+        # Prepare encoder's final hidden layer to be first hidden input to the decoder
+        decoder_hidden = encoder_hidden[:self.decoder.n_layers]
+        # Initialize decoder input with SOS_token
+        decoder_input = torch.ones(1, 1, device=device, dtype=torch.long) * SOS_token
+        # Initialize tensors to append decoded words to
+        all_tokens = torch.zeros([0], device=device, dtype=torch.long)
+        all_scores = torch.zeros([0], device=device)
+        # Iteratively decode one word token at a time
+        for _ in range(max_length):
+            # Forward pass through decoder
+            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_outputs)
+            # Obtain most likely word token and its softmax score
+            decoder_scores, decoder_input = torch.max(decoder_output, dim=1)
+            # Record token and score
+            all_tokens = torch.cat((all_tokens, decoder_input), dim=0)
+            all_scores = torch.cat((all_scores, decoder_scores), dim=0)
+            # Prepare current token to be next decoder input (add a dimension)
+            decoder_input = torch.unsqueeze(decoder_input, 0)
+        # Return collections of word tokens and scores
+        return all_tokens, all_scores
 
 
-def main():
-    print("Loading dataset ....")
+def maskNLLLoss(inp, target, mask):
+    nTotal = mask.sum()
+    crossEntropy = -torch.log(torch.gather(inp, 1, target.view(-1, 1)).squeeze(1))
+    loss = crossEntropy.masked_select(mask).mean()
+    loss = loss.to(device)
+    return loss, nTotal.item()
 
-    dataset = load_dataset(configs['data_dir'] + configs['train_path'],
-                           configs['data_dir'] + configs['valid_path'],
-                           configs['data_dir'] + configs['vocab_path'])
 
-    dict_checkpoint = (configs['train_from'] if configs['train_from']
-                       else configs['train_from_state_dict'])
-    if dict_checkpoint:
-        print('Loading dicts from checkpoint at %s' % dict_checkpoint)
-        checkpoint = torch.load(dict_checkpoint)
-        dataset['dicts'] = checkpoint['dicts']
+def train(input_variable, lengths, target_variable, mask, max_target_len, encoder, decoder, embedding,
+          encoder_optimizer, decoder_optimizer, batch_size, clip, max_length=MAX_LENGTH):
 
-    train_set = Dataset(dataset['train']['data'],
-                        configs['batch_size'],
-                        cuda=configs['cuda'],
-                        volatile=False)
+    # Zero gradients
+    encoder_optimizer.zero_grad()
+    decoder_optimizer.zero_grad()
 
-    valid_set = Dataset(dataset['valid']['data'],
-                        configs['batch_size'],
-                        cuda=configs['cuda'],
-                        volatile=True, ret_limit=1000)
+    # Set device options
+    input_variable = input_variable.to(device)
+    lengths = lengths.to(device)
+    target_variable = target_variable.to(device)
+    mask = mask.to(device)
 
-    vocab = dataset['vocab']
-    configs['vocab_size'] = vocab.size
+    # Initialize variables
+    loss = 0
+    print_losses = []
+    n_totals = 0
 
-    print(' * vocabulary size = %d' % vocab.size)
-    print(" * training samples:\t{};\tbatches:\t{}".format(train_set.num_samples, train_set.num_batches))
-    print(" * valid samples:\t{};\tbatches:\t{}".format(valid_set.num_samples, valid_set.num_batches))
-    print(' * maximum batch size. %d' % configs['batch_size'])
+    # Forward pass through encoder
+    encoder_outputs, encoder_hidden = encoder(input_variable, lengths)
 
-    print('Building model...')
+    # Create initial decoder input (start with SOS tokens for each sentence)
+    decoder_input = torch.LongTensor([[SOS_token for _ in range(batch_size)]])
+    decoder_input = decoder_input.to(device)
 
-    model = Seq2SeqDialogModel(configs)
-    generator = nn.Linear(configs['dec_hidden_size'], vocab.size)
+    # Set initial decoder hidden state to the encoder's final hidden state
+    decoder_hidden = encoder_hidden[:decoder.n_layers]
 
-    if configs['train_from']:
-        print('Loading model from checkpoint at %s' % configs['train_from'])
-        chk_model = checkpoint['model']
-        generator_state_dict = chk_model.generator.state_dict()
-        model_state_dict = {k: v for k, v in chk_model.state_dict().items()
-                            if 'generator' not in k}
-        model.load_state_dict(model_state_dict)
-        generator.load_state_dict(generator_state_dict)
-        configs['start_epoch'] = checkpoint['epoch'] + 1
+    # Determine if we are using teacher forcing this iteration
+    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
 
-    if configs['train_from_state_dict']:
-        print('Loading model from checkpoint at %s'
-              % configs['train_from_state_dict'])
-        model.load_state_dict(checkpoint['model'])
-        generator.load_state_dict(checkpoint['generator'])
-        configs['start_epoch'] = checkpoint['epoch'] + 1
-
-    if len(configs['gpus']) >= 1:
-        model.cuda()
-        generator.cuda()
+    # Forward batch of sequences through decoder one time step at a time
+    if use_teacher_forcing:
+        for t in range(max_target_len):
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden, encoder_outputs
+            )
+            # Teacher forcing: next input is current target
+            decoder_input = target_variable[t].view(1, -1)
+            # Calculate and accumulate loss
+            mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
+            loss += mask_loss
+            print_losses.append(mask_loss.item() * nTotal)
+            n_totals += nTotal
     else:
-        model.cpu()
-        generator.cpu()
+        for t in range(max_target_len):
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden, encoder_outputs
+            )
+            # No teacher forcing: next input is decoder's own current output
+            _, topi = decoder_output.topk(1)
+            decoder_input = torch.LongTensor([[topi[i][0] for i in range(batch_size)]])
+            decoder_input = decoder_input.to(device)
+            # Calculate and accumulate loss
+            mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
+            loss += mask_loss
+            print_losses.append(mask_loss.item() * nTotal)
+            n_totals += nTotal
 
-    if len(configs['gpus']) > 1:
-        model = nn.DataParallel(model, device_ids=configs['gpus'], dim=1)
-        generator = nn.DataParallel(generator, device_ids=configs['gpus'], dim=0)
+    # Perform backpropatation
+    loss.backward()
 
-    model.generator = generator
+    # Clip gradients: gradients are modified in place
+    _ = nn.utils.clip_grad_norm_(encoder.parameters(), clip)
+    _ = nn.utils.clip_grad_norm_(decoder.parameters(), clip)
 
-    if not configs['train_from_state_dict'] and not configs['train_from']:
-        for p in model.parameters():
-            p.data.uniform_(-configs['param_init'], configs['param_init'])
+    # Adjust model weights
+    encoder_optimizer.step()
+    decoder_optimizer.step()
 
-        optim = Optim(
-            configs['optim'], configs['learning_rate'], configs['max_grad_norm'],
-            lr_decay=configs['learning_rate_decay'],
-            start_decay_at=configs['start_decay_at']
-        )
-    else:
-        print('Loading optimizer from checkpoint:')
-        optim = checkpoint['optim']
-        print(optim)
-
-    optim.set_parameters(model.parameters())
-
-    if configs['train_from'] or configs['train_from_state_dict']:
-        optim.optimizer.load_state_dict(
-            checkpoint['optim'].optimizer.state_dict())
-
-    n_params = sum([p.nelement() for p in model.parameters()])
-    print('* number of parameters: %d' % n_params)
-
-    train_model(model, train_set, valid_set, vocab, optim)
+    return sum(print_losses) / n_totals
 
 
-if __name__ == "__main__":
-    main()
+def trainIters(model_name, voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimizer, embedding, encoder_n_layers, decoder_n_layers, save_dir, n_iteration, batch_size, print_every, save_every, clip, corpus_name, loadFilename):
+
+    # Load batches for each iteration
+    training_batches = [batch2TrainData(voc, [random.choice(pairs) for _ in range(batch_size)])
+                      for _ in range(n_iteration)]
+
+    # Initializations
+    print('Initializing ...')
+    start_iteration = 1
+    print_loss = 0
+    if loadFilename:
+        start_iteration = checkpoint['iteration'] + 1
+
+    # Training loop
+    print("Training...")
+    for iteration in range(start_iteration, n_iteration + 1):
+        training_batch = training_batches[iteration - 1]
+        # Extract fields from batch
+        input_variable, lengths, target_variable, mask, max_target_len = training_batch
+
+        # Run a training iteration with batch
+        loss = train(input_variable, lengths, target_variable, mask, max_target_len, encoder,
+                     decoder, embedding, encoder_optimizer, decoder_optimizer, batch_size, clip)
+        print_loss += loss
+
+        # Print progress
+        if iteration % print_every == 0:
+            print_loss_avg = print_loss / print_every
+            print("Iteration: {}; Percent complete: {:.1f}%; Average loss: {:.4f}".format(iteration, iteration / n_iteration * 100, print_loss_avg))
+            print_loss = 0
+
+        # Save checkpoint
+        if (iteration % save_every == 0):
+            directory = os.path.join(save_dir, model_name, corpus_name, '{}-{}_{}'.format(encoder_n_layers, decoder_n_layers, hidden_size))
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+            torch.save({
+                'iteration': iteration,
+                'en': encoder.state_dict(),
+                'de': decoder.state_dict(),
+                'en_opt': encoder_optimizer.state_dict(),
+                'de_opt': decoder_optimizer.state_dict(),
+                'loss': loss,
+                'voc_dict': voc.__dict__,
+                'embedding': embedding.state_dict()
+            }, os.path.join(directory, '{}_{}.tar'.format(iteration, 'checkpoint')))
+
+def evaluate(encoder, decoder, searcher, voc, sentence, max_length=MAX_LENGTH):
+    ### Format input sentence as a batch
+    # words -> indexes
+    indexes_batch = [indexesFromSentence(voc, sentence)]
+    # Create lengths tensor
+    lengths = torch.tensor([len(indexes) for indexes in indexes_batch])
+    # Transpose dimensions of batch to match models' expectations
+    input_batch = torch.LongTensor(indexes_batch).transpose(0, 1)
+    # Use appropriate device
+    input_batch = input_batch.to(device)
+    lengths = lengths.to(device)
+    # Decode sentence with searcher
+    tokens, scores = searcher(input_batch, lengths, max_length)
+    # indexes -> words
+    decoded_words = [voc.index2word[token.item()] for token in tokens]
+    return decoded_words
+
+
+def evaluateInput(encoder, decoder, searcher, voc):
+    input_sentence = ''
+    while(1):
+        try:
+            # Get input sentence
+            input_sentence = input('> ')
+            # Check if it is quit case
+            if input_sentence == 'q' or input_sentence == 'quit': break
+            # Normalize sentence
+            input_sentence = normalizeString(input_sentence)
+            # Evaluate sentence
+            output_words = evaluate(encoder, decoder, searcher, voc, input_sentence)
+            # Format and print response sentence
+            output_words[:] = [x for x in output_words if not (x == 'EOS' or x == 'PAD')]
+            print('Bot:', ' '.join(output_words))
+
+        except KeyError:
+            print("Error: Encountered unknown word.")
+
+
+# Configure models
+model_name = 'cb_model'
+attn_model = 'dot'
+#attn_model = 'general'
+#attn_model = 'concat'
+hidden_size = 500
+encoder_n_layers = 2
+decoder_n_layers = 2
+dropout = 0.1
+batch_size = 64
+
+# Set checkpoint to load from; set to None if starting from scratch
+loadFilename = None
+checkpoint_iter = 4000
+#loadFilename = os.path.join(save_dir, model_name, corpus_name,
+#                            '{}-{}_{}'.format(encoder_n_layers, decoder_n_layers, hidden_size),
+#                            '{}_checkpoint.tar'.format(checkpoint_iter))
+
+
+# Load model if a loadFilename is provided
+if loadFilename:
+    # If loading on same machine the model was trained on
+    checkpoint = torch.load(loadFilename)
+    # If loading a model trained on GPU to CPU
+    #checkpoint = torch.load(loadFilename, map_location=torch.device('cpu'))
+    encoder_sd = checkpoint['en']
+    decoder_sd = checkpoint['de']
+    encoder_optimizer_sd = checkpoint['en_opt']
+    decoder_optimizer_sd = checkpoint['de_opt']
+    embedding_sd = checkpoint['embedding']
+    voc.__dict__ = checkpoint['voc_dict']
+
+
+print('Building encoder and decoder ...')
+# Initialize word embeddings
+embedding = nn.Embedding(voc.num_words, hidden_size)
+if loadFilename:
+    embedding.load_state_dict(embedding_sd)
+# Initialize encoder & decoder models
+encoder = EncoderRNN(hidden_size, embedding, encoder_n_layers, dropout)
+decoder = LuongAttnDecoderRNN(attn_model, embedding, hidden_size, voc.num_words, decoder_n_layers, dropout)
+if loadFilename:
+    encoder.load_state_dict(encoder_sd)
+    decoder.load_state_dict(decoder_sd)
+# Use appropriate device
+encoder = encoder.to(device)
+decoder = decoder.to(device)
+print('Models built and ready to go!')
+
+# Configure training/optimization
+clip = 50.0
+teacher_forcing_ratio = 1.0
+learning_rate = 0.0001
+decoder_learning_ratio = 5.0
+n_iteration = 4000
+print_every = 1
+save_every = 500
+
+# Ensure dropout layers are in train mode
+encoder.train()
+decoder.train()
+
+# Initialize optimizers
+print('Building optimizers ...')
+encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate * decoder_learning_ratio)
+if loadFilename:
+    encoder_optimizer.load_state_dict(encoder_optimizer_sd)
+    decoder_optimizer.load_state_dict(decoder_optimizer_sd)
+
+# Run training iterations
+print("Starting Training!")
+trainIters(model_name, voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimizer,
+           embedding, encoder_n_layers, decoder_n_layers, save_dir, n_iteration, batch_size,
+           print_every, save_every, clip, corpus_name, loadFilename)
+
+# Set dropout layers to eval mode
+encoder.eval()
+decoder.eval()
+
+# Initialize search module
+searcher = GreedySearchDecoder(encoder, decoder)
+
+# Begin chatting (uncomment and run the following line to begin)
+evaluateInput(encoder, decoder, searcher, voc)
